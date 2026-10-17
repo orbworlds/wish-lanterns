@@ -1,0 +1,20 @@
+{
+  "name": "wish-lanterns",
+  "private": true,
+  "description": "Write a wish and let it float up as a glowing lantern, into a sky full of other people's wishes.",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://orbworlds.com/orb/wish-lanterns",
+  "scripts": {
+    "start": "node orb-kit/bin/orb.mjs dev .",
+    "share": "node orb-kit/bin/orb.mjs share",
+    "test": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0",
+    "three": "^0.186.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

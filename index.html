@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Wish Lanterns</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #070a1f; font-family: ui-rounded, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  canvas { display: block; touch-action: none; }
+  .glass { background: rgba(255,255,255,.1); backdrop-filter: blur(16px) saturate(160%); -webkit-backdrop-filter: blur(16px) saturate(160%); border: 1px solid rgba(255,255,255,.18); color: #fff; }
+  #count { position: fixed; top: max(14px, env(safe-area-inset-top)); left: max(14px, env(safe-area-inset-left)); padding: 8px 14px; border-radius: 999px; font-size: 14px; font-weight: 600; white-space: nowrap; }
+  #wish { position: fixed; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%); display: flex; gap: 6px; padding: 6px; border-radius: 999px; width: min(460px, calc(100vw - 140px)); box-sizing: border-box; }
+  #wish input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: #fff; font: inherit; font-size: 16px; padding: 0 12px; }
+  #wish input::placeholder { color: rgba(255,255,255,.7); }
+  #wish button { border: 0; border-radius: 999px; padding: 0 18px; height: 42px; font: inherit; font-weight: 700; font-size: 15px; color: #3a2207; background: linear-gradient(180deg, #ffe0a6, #ffb45e); cursor: pointer; white-space: nowrap; box-shadow: 0 0 24px rgba(255,190,110,.5); transition: transform .15s, opacity .2s; }
+  #wish button:active { transform: scale(.96); }
+  #wish button:disabled { opacity: .5; cursor: default; box-shadow: none; }
+  #hint { position: fixed; bottom: calc(max(16px, env(safe-area-inset-bottom)) + 66px); left: 50%; transform: translateX(-50%); padding: 7px 13px; border-radius: 999px; font-size: 13px; transition: opacity 1s; white-space: nowrap; pointer-events: none; }
+  #card { position: fixed; top: calc(max(14px, env(safe-area-inset-top)) + 52px); left: 50%; transform: translateX(-50%) translateY(-6px); max-width: min(380px, calc(100vw - 32px)); padding: 14px 18px; border-radius: 18px; text-align: center; opacity: 0; pointer-events: none; transition: opacity .35s, transform .35s; }
+  #card.on { opacity: 1; transform: translateX(-50%); }
+  #card .w { font-size: 18px; line-height: 1.35; font-style: italic; text-shadow: 0 0 18px rgba(255,200,120,.45); }
+  #card .by { margin-top: 6px; font-size: 13px; opacity: .75; }
+  @media (max-width: 560px) {
+    #wish { left: max(12px, env(safe-area-inset-left)); transform: none; width: calc(100vw - 120px); }
+    #hint { left: max(12px, env(safe-area-inset-left)); transform: none; }
+  }
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.186.1/examples/jsm/"}}</script>
+</head>
+<body>
+<div id="count" class="glass">🏮 Lanterns are rising…</div>
+<div id="hint" class="glass">Drag to look around · tap a lantern to read its wish</div>
+<div id="card" class="glass" role="status"><div class="w"></div><div class="by"></div></div>
+<form id="wish" class="glass" autocomplete="off">
+  <input id="wishText" maxlength="90" placeholder="Make a wish…" aria-label="Your wish">
+  <button id="release" type="submit" disabled>Release ✨</button>
+</form>
+<script type="module">
+import * as THREE from 'three';
+import { Water } from 'three/addons/objects/Water.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// === CONFIG ===
+const CONFIG = {
+  sky: { zenith: '#03051a', mid: '#141a4a', horizon: '#5b3a6e', glow: '#ff9d6b' },
+  water: '#061232',
+  lakeRadius: 60,
+  maxLanterns: 200,          // the shared list keeps the newest 200 wishes
+  riseSeconds: 38,           // a new lantern floats from the dock up into the sky
+  skyLanterns: 140,          // distant lanterns always drifting up, for atmosphere
+  waterLanterns: 26,         // little lanterns floating on the lake
+  lanternColors: ['#ffa040', '#ff8a3d', '#ffc25a', '#ff9f5c', '#ffb85e'],
+  bloom: { strength: 0.85, radius: 0.6, threshold: 0.7 },
+  fireflies: 140,
+};
+const KEY = 'lanterns';
+
+const orb = window.orb;
+const me = orb?.me ?? { id: 'me', name: 'You', color: '#ffb45e' };
+const isTouch = matchMedia('(pointer: coarse)').matches && !matchMedia('(any-pointer: fine)').matches;
+const small = Math.min(innerWidth, innerHeight) < 600;
+
+// Shared list: orb.store inside Orb, this browser's storage when the file runs on its own.
+const store = orb?.store ?? {
+  async get(k) { try { return JSON.parse(localStorage.getItem('store:' + k)); } catch { return null; } },
+  async push(k, item, max = 50) { const l = ((await this.get(k)) || []).concat([item]).slice(-max); localStorage.setItem('store:' + k, JSON.stringify(l)); return l; },
+};
+
+// Gentle filter: wishes are shown to everyone (and many visitors are kids).
+const BLOCK = /\b(fuck\w*|shit\w*|bitch\w*|cunt\w*|dick\w*|cock\w*|puss(y|ies)|asshole\w*|bastard\w*|whore\w*|slut\w*|nigg\w*|fag\w*|retard\w*|kill (yo)?urself|kys|porn\w*|sex\w*|nazi\w*)\b/gi;
+const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 90).replace(BLOCK, '✨');
+
+// === SCENE ===
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(devicePixelRatio, small ? 1.5 : 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.95;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2('#1c1838', 0.0032);
+const camera = new THREE.PerspectiveCamera(small ? 66 : 56, innerWidth / innerHeight, 0.1, 2000);
+const EYE = new THREE.Vector3(0, 3.2, CONFIG.lakeRadius - 4);
+camera.position.copy(EYE);
+
+// === SKY & LIGHT ===
+// One shader: night gradient, a warm glow along the horizon, thousands of twinkling stars and a
+// soft Milky Way band.
+const MOON_DIR = new THREE.Vector3(-0.42, 0.3, -1).normalize();
+const skyMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: {
+    time: { value: 0 },
+    zenith: { value: new THREE.Color(CONFIG.sky.zenith) }, mid: { value: new THREE.Color(CONFIG.sky.mid) },
+    horizon: { value: new THREE.Color(CONFIG.sky.horizon) }, glow: { value: new THREE.Color(CONFIG.sky.glow) },
+    moonDir: { value: MOON_DIR },
+  },
+  vertexShader: 'varying vec3 vP; void main(){ vP = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }',
+  fragmentShader: `
+    uniform float time; uniform vec3 zenith, mid, horizon, glow, moonDir; varying vec3 vP;
+    float h3(vec3 p){ p = fract(p * .3183099 + .1); p *= 17.; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+    float n3(vec3 x){ vec3 i = floor(x), f = fract(x); f = f*f*(3.-2.*f);
+      return mix(mix(mix(h3(i), h3(i+vec3(1,0,0)), f.x), mix(h3(i+vec3(0,1,0)), h3(i+vec3(1,1,0)), f.x), f.y),
+                 mix(mix(h3(i+vec3(0,0,1)), h3(i+vec3(1,0,1)), f.x), mix(h3(i+vec3(0,1,1)), h3(i+vec3(1,1,1)), f.x), f.y), f.z); }
+    float fbm(vec3 p){ float a = .5, s = 0.; for (int i = 0; i < 5; i++){ s += a * n3(p); p *= 2.03; a *= .5; } return s; }
+    void main(){
+      vec3 d = normalize(vP); float h = d.y;
+      vec3 c = mix(horizon, mid, smoothstep(-.02, .25, h)); c = mix(c, zenith, smoothstep(.25, .85, h));
+      // warm afterglow low on the horizon, strongest towards the moon
+      float toward = max(0., dot(normalize(vec3(d.x, 0., d.z)), normalize(vec3(moonDir.x, 0., moonDir.z))));
+      c += glow * .35 * pow(max(0., 1. - abs(h) * 6.), 2.5) * (.35 + .65 * toward);
+      // Milky Way: a tilted band of cloudy light with dust lanes
+      vec3 axis = normalize(vec3(.35, .55, .76));
+      float band = exp(-pow(dot(d, axis) * 5.5, 2.));
+      float cloud = fbm(d * 6.) * .65 + fbm(d * 18.) * .35;
+      float dust = smoothstep(.45, .75, fbm(d * 9. + 3.));
+      c += vec3(.5, .46, .78) * band * pow(cloud, 1.6) * (1. - .7 * dust) * .2 * smoothstep(0., .25, h);
+      // stars (denser inside the Milky Way), twinkling
+      vec3 g = d * 420.; vec3 cell = floor(g);
+      float r = h3(cell); float star = step(.9965 - band * .004, r);
+      float tw = .6 + .4 * sin(time * (1. + r * 3.) + r * 40.);
+      float dd = length(fract(g) - .5);
+      c += vec3(1., .96, .9) * star * smoothstep(.45, .0, dd) * tw * smoothstep(-.02, .12, h) * (1.4 + band);
+      // moon halo
+      float m = max(0., dot(d, moonDir));
+      c += vec3(1., .92, .8) * (pow(m, 60.) * .12 + pow(m, 8.) * .03);
+      gl_FragColor = vec4(c, 1.);
+    }`,
+});
+scene.add(new THREE.Mesh(new THREE.SphereGeometry(1500, 48, 24), skyMat));
+
+// The moon itself: a bright disc (blooms) with soft craters.
+function dotTexture(soft = 0.5) {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const r = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  r.addColorStop(0, 'rgba(255,255,255,1)'); r.addColorStop(soft, 'rgba(255,255,255,.3)'); r.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = r; g.fillRect(0, 0, 64, 64);
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const DOT = dotTexture(0.3);
+{
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  const disc = g.createRadialGradient(118, 116, 10, 128, 128, 120);
+  disc.addColorStop(0, '#fffdf6'); disc.addColorStop(1, '#efe2c8');
+  g.fillStyle = disc; g.beginPath(); g.arc(128, 128, 120, 0, Math.PI * 2); g.fill();
+  g.fillStyle = 'rgba(180,165,140,.22)';
+  for (const [x, y, r] of [[96, 98, 30], [160, 150, 22], [140, 88, 14], [88, 160, 16], [182, 108, 10]]) { g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace;
+  const moon = new THREE.Mesh(new THREE.CircleGeometry(26, 64), new THREE.MeshBasicMaterial({ map: t, transparent: true, fog: false, toneMapped: false, color: new THREE.Color(1.15, 1.12, 1.05) }));
+  moon.position.copy(MOON_DIR).multiplyScalar(1100); moon.lookAt(0, 0, 0); moon.scale.setScalar(0.8); scene.add(moon);
+}
+
+scene.add(new THREE.HemisphereLight('#5a5fb8', '#120c26', 0.75));
+const moonLight = new THREE.DirectionalLight('#b9b8ff', 0.35); moonLight.position.copy(MOON_DIR).multiplyScalar(100); scene.add(moonLight);
+const warm = new THREE.PointLight('#ffae62', 22, 22, 1.7); warm.position.set(1.4, 3, EYE.z - 10); scene.add(warm);
+
+// === WORLD ===
+// Water that really reflects: the moon, the mountains and every lantern ripple in it.
+function normalMap() {
+  // Tileable ripples: a sum of sine waves with whole-number frequencies, turned into normals.
+  const N = 256, h = new Float32Array(N * N), waves = [];
+  for (let i = 0; i < 14; i++) waves.push([1 + Math.floor(Math.random() * 7), 1 + Math.floor(Math.random() * 7), Math.random() * 6.28, 1 / (1 + i * 0.35), Math.random() < 0.5 ? 1 : -1]);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    let v = 0; for (const [fx, fy, p, a, s] of waves) v += a * Math.sin(((fx * x + s * fy * y) / N) * Math.PI * 2 + p);
+    h[y * N + x] = v;
+  }
+  const c = document.createElement('canvas'); c.width = c.height = N;
+  const g = c.getContext('2d'), img = g.createImageData(N, N);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const dx = h[y * N + ((x + 1) % N)] - h[y * N + ((x - 1 + N) % N)], dy = h[((y + 1) % N) * N + x] - h[((y - 1 + N) % N) * N + x];
+    const nx = -dx * 0.6, ny = -dy * 0.6, nz = 1, l = Math.hypot(nx, ny, nz), i = (y * N + x) * 4;
+    img.data[i] = (nx / l * 0.5 + 0.5) * 255; img.data[i + 1] = (ny / l * 0.5 + 0.5) * 255; img.data[i + 2] = (nz / l * 0.5 + 0.5) * 255; img.data[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; return t;
+}
+const water = new Water(new THREE.CircleGeometry(CONFIG.lakeRadius + 260, 64), {
+  textureWidth: small ? 512 : 1024, textureHeight: small ? 512 : 1024,
+  waterNormals: normalMap(), sunDirection: MOON_DIR.clone(), sunColor: '#6f6656', waterColor: CONFIG.water,
+  distortionScale: 1.6, fog: true, alpha: 1,
+});
+water.rotation.x = -Math.PI / 2;
+water.material.uniforms.size.value = 4;
+scene.add(water);
+
+// Mountains: three misty ridges, each fainter with distance.
+function ridge(radius, height, color, seed, segments = 160) {
+  const pos = [], idx = [];
+  for (let i = 0; i <= segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    let hgt = 0; for (let k = 1; k <= 5; k++) hgt += Math.sin(a * (k * 2 + 1) + seed * k * 1.7) / k;
+    hgt = height * (0.55 + 0.45 * hgt * 0.6) * (0.7 + 0.3 * Math.sin(a * 3 + seed));
+    const x = Math.cos(a) * radius, z = Math.sin(a) * radius;
+    pos.push(x, -2, z, x, Math.max(2, hgt), z);
+    if (i < segments) { const j = i * 2; idx.push(j, j + 2, j + 1, j + 1, j + 2, j + 3); }
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx); g.computeVertexNormals();
+  const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, fog: true }));
+  scene.add(m); return m;
+}
+ridge(430, 120, '#2a2350', 1.3);
+ridge(300, 85, '#1b1838', 4.1);
+ridge(190, 46, '#110f26', 7.7);
+
+// Near shore with pine silhouettes (the dock side stays open).
+{
+  const shore = new THREE.Mesh(new THREE.RingGeometry(CONFIG.lakeRadius, CONFIG.lakeRadius + 70, 96, 1), new THREE.MeshStandardMaterial({ color: '#0c0b1d', roughness: 1 }));
+  shore.rotation.x = -Math.PI / 2; shore.position.y = 0.05; scene.add(shore);
+  const pines = new THREE.InstancedMesh(new THREE.ConeGeometry(1.8, 9, 7), new THREE.MeshStandardMaterial({ color: '#0b0c20', roughness: 1, flatShading: true }), 260);
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+  for (let i = 0; i < 260; i++) {
+    const a = Math.random() * Math.PI * 2;
+    if (Math.abs(Math.atan2(Math.sin(a - Math.PI / 2), Math.cos(a - Math.PI / 2))) < 0.42) { i--; continue; }
+    const r = CONFIG.lakeRadius + 3 + Math.random() * 40, k = 0.6 + Math.random() * 1.3;
+    m.compose(new THREE.Vector3(Math.cos(a) * r, 4.5 * k, Math.sin(a) * r), q, s.set(k, k * (0.9 + Math.random() * 0.4), k));
+    pines.setMatrixAt(i, m);
+  }
+  scene.add(pines);
+}
+
+// A little pagoda on the far shore, its windows glowing.
+{
+  const g = new THREE.Group();
+  const wall = new THREE.MeshStandardMaterial({ color: '#15122c', roughness: 1 });
+  const roof = new THREE.MeshStandardMaterial({ color: '#0d0b1e', roughness: 1, flatShading: true });
+  const lit = new THREE.MeshBasicMaterial({ color: new THREE.Color(1.3, 0.75, 0.3), toneMapped: false });
+  for (let i = 0; i < 4; i++) {
+    const w = 7 - i * 1.3, y = i * 4.2;
+    const body = new THREE.Mesh(new THREE.BoxGeometry(w, 3, w), wall); body.position.y = y + 1.5; g.add(body);
+    const top = new THREE.Mesh(new THREE.ConeGeometry(w * 0.95, 1.8, 4), roof); top.position.y = y + 3.8; top.rotation.y = Math.PI / 4; g.add(top);
+    const win = new THREE.Mesh(new THREE.PlaneGeometry(w * 0.45, 1.3), lit); win.position.set(0, y + 1.6, w / 2 + 0.02); g.add(win);
+  }
+  const spire = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.2, 4, 6), roof); spire.position.y = 18.5; g.add(spire);
+  g.position.set(-38, 0, -CONFIG.lakeRadius - 18); g.lookAt(EYE.x, 0, EYE.z); g.scale.setScalar(1.3);
+  scene.add(g);
+  const shoreLights = new THREE.PointLight('#ffae62', 60, 60, 1.6); shoreLights.position.set(-38, 6, -CONFIG.lakeRadius - 10); scene.add(shoreLights);
+}
+
+// The dock you stand on, with a paper lantern on a post.
+{
+  const wood = new THREE.MeshStandardMaterial({ color: '#3d2a20', roughness: 0.9 });
+  for (let i = 0; i < 18; i++) {
+    const plank = new THREE.Mesh(new THREE.BoxGeometry(3.4, 0.16, 0.66), wood);
+    plank.position.set((Math.random() - 0.5) * 0.06, 0.7, EYE.z + 1 - i * 0.74); plank.rotation.y = (Math.random() - 0.5) * 0.03; scene.add(plank);
+  }
+  for (const x of [-1.6, 1.6]) for (let j = 0; j < 4; j++) {
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.14, 2, 8), wood); post.position.set(x, 0.3, EYE.z - j * 3.8); scene.add(post);
+  }
+  const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 2, 6), wood); pole.position.set(1.5, 1.7, EYE.z - 11.5); scene.add(pole);
+  const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.26, 16, 12), new THREE.MeshBasicMaterial({ color: new THREE.Color(1.5, 0.85, 0.35), toneMapped: false }));
+  lamp.position.set(1.5, 2.8, EYE.z - 11.5); scene.add(lamp);
+}
+
+// Fireflies along the shore.
+const flies = (() => {
+  const n = CONFIG.fireflies, pos = new Float32Array(n * 3), seed = [];
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, r = CONFIG.lakeRadius - 4 + Math.random() * 18;
+    const x = Math.cos(a) * r, z = Math.sin(a) * r;
+    if (Math.hypot(x - EYE.x, z - EYE.z) < 10) { i--; continue; }
+    pos.set([x, 0.6 + Math.random() * 4, z], i * 3); seed.push(Math.random() * 10);
+  }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const p = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.45, map: DOT, color: new THREE.Color(1.4, 2.0, 0.9), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false }));
+  p.userData.seed = seed; scene.add(p); return p;
+})();
+
+// === LANTERNS ===
+// Paper lanterns: one instanced body (glowing paper, darker rims); bloom turns them into soft
+// warm lights, and the water reflects them.
+const MAX = CONFIG.maxLanterns + 40;
+const lanternGeo = (() => {
+  const pts = [];
+  for (let i = 0; i <= 14; i++) { const t = i / 14; pts.push(new THREE.Vector2(0.2 + Math.sin(t * Math.PI) * 0.32, t * 1.0)); }
+  const g = new THREE.LatheGeometry(pts, 16);
+  const col = [], pos = g.attributes.position;
+  for (let i = 0; i < pos.count; i++) { const y = pos.getY(i); const k = 0.35 + 0.65 * Math.pow(Math.sin(y * Math.PI), 0.7) * (1.15 - y * 0.35); col.push(k, k * 0.74, k * 0.46); }
+  g.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  g.translate(0, -0.5, 0);
+  return g;
+})();
+const lanternMat = new THREE.MeshBasicMaterial({ vertexColors: true, toneMapped: false, side: THREE.DoubleSide });
+function lanternMesh(count) { const m = new THREE.InstancedMesh(lanternGeo, lanternMat, count); m.count = 0; m.frustumCulled = false; scene.add(m); return m; }
+const bodies = lanternMesh(MAX);
+
+// Soft halos around the wish lanterns (additive points, sized in world units).
+const halos = (() => {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(MAX * 3), 3));
+  g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(MAX * 3), 3));
+  const m = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
+    uniforms: { map: { value: DOT }, px: { value: renderer.getPixelRatio() * innerHeight * 0.5 } },
+    vertexShader: `attribute vec3 color; uniform float px; varying vec3 vC;
+      void main(){ vC = color; vec4 mv = modelViewMatrix * vec4(position, 1.); gl_PointSize = min(9. * px / -mv.z, 400.); gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: 'uniform sampler2D map; varying vec3 vC; void main(){ float a = pow(texture2D(map, gl_PointCoord).a, 1.7) * .8; gl_FragColor = vec4(vC, a); }',
+  });
+  const p = new THREE.Points(g, m); p.frustumCulled = false; scene.add(p); return p;
+})();
+
+// Atmosphere: far-away lanterns forever drifting up into the stars, and lanterns floating on the lake.
+const sky = lanternMesh(CONFIG.skyLanterns);
+const skySeeds = Array.from({ length: CONFIG.skyLanterns }, () => ({ a: Math.random() * Math.PI * 2, r: 70 + Math.random() * 260, y: Math.random(), s: 0.6 + Math.random() * 0.9, ph: Math.random() * 10, c: new THREE.Color(CONFIG.lanternColors[Math.floor(Math.random() * 5)]) }));
+const floaters = lanternMesh(CONFIG.waterLanterns);
+const floatSeeds = Array.from({ length: CONFIG.waterLanterns }, () => ({ a: Math.random() * Math.PI * 2, r: 8 + Math.random() * (CONFIG.lakeRadius - 14), ph: Math.random() * 10, sp: (Math.random() - 0.5) * 0.01, c: new THREE.Color(CONFIG.lanternColors[Math.floor(Math.random() * 5)]) }));
+
+const lanterns = [];           // shared wishes (+ Orb's starters)
+const known = new Set();
+function hash(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+  return (h >>> 0) / 4294967295;
+}
+function addLantern(item, { fresh = false } = {}) {
+  if (!item || typeof item.id !== 'string' || known.has(item.id)) return null;
+  known.add(item.id);
+  const r1 = hash(item.id), r2 = hash(item.id + 'b'), r3 = hash(item.id + 'c');
+  const l = {
+    id: item.id, w: clean(item.w) || '✨', n: clean(item.n).slice(0, 30) || 'Someone', t: Number(item.t) || Date.now(), orbSeed: !!item.orbSeed,
+    mine: item.by === me.id,
+    color: new THREE.Color(CONFIG.lanternColors[Math.floor(r1 * CONFIG.lanternColors.length)]).lerp(new THREE.Color(item.c || '#ffb45e'), 0.15),
+    angle: hash(item.id + 'a') * Math.PI * 2, radius: 8 + r2 * (CONFIG.lakeRadius - 8), height: 12 + r3 * 34, speed: (0.004 + r2 * 0.01) * (r3 > 0.5 ? 1 : -1),
+    phase: r3 * 10, born: fresh ? performance.now() / 1000 : -1e9, pos: new THREE.Vector3(),
+  };
+  lanterns.push(l);
+  if (lanterns.length > MAX) { const old = lanterns.shift(); known.delete(old.id); }
+  updateCount();
+  return l;
+}
+
+function updateCount() {
+  const n = lanterns.filter((l) => !l.orbSeed).length;
+  document.getElementById('count').textContent = n ? `🏮 ${n} ${n === 1 ? 'wish' : 'wishes'} in the sky` : '🏮 Be the first to make a wish';
+}
+
+// A few lanterns from Orb until real wishes arrive (one makes way for each real wish).
+const STARTERS = ['I wish everyone finds a good friend today', 'I hope the moon is having a nice night', 'I wish for a puppy who likes naps', 'Kindness, everywhere, always', 'I wish my grandma feels better soon', 'I hope tomorrow is full of sunshine', 'I wish I could fly like a lantern', 'May everyone sleep well tonight', 'I wish for a summer that never ends', 'I hope my drawing wins!'];
+function seedStarters(n) { STARTERS.slice(0, n).forEach((w, i) => addLantern({ id: 'orb-' + i, w, n: 'Orb', t: Date.now() - (i + 1) * 3600e3 * 7, orbSeed: true })); }
+
+const DOCK_END = new THREE.Vector3(0.6, 1.6, EYE.z - 12);
+const m4 = new THREE.Matrix4(), q4 = new THREE.Quaternion(), s4 = new THREE.Vector3(), e4 = new THREE.Euler(), tint = new THREE.Color(), p4 = new THREE.Vector3();
+function layoutLanterns(time) {
+  const hp = halos.geometry.attributes.position.array, hc = halos.geometry.attributes.color.array;
+  const now = Date.now();
+  lanterns.forEach((l, i) => {
+    // Older wishes drift higher and a little dimmer, so the sky keeps a sense of time.
+    const days = Math.max(0, (now - l.t) / 86400e3);
+    const lift = Math.min(22, days * 3);
+    const a = l.angle + time * l.speed;
+    p4.set(Math.cos(a) * l.radius, l.height + lift + Math.sin(time * 0.5 + l.phase) * 0.7, Math.sin(a) * l.radius - 6);
+    const age = time - l.born;
+    if (age < CONFIG.riseSeconds) {
+      const k = age / CONFIG.riseSeconds, e = 1 - Math.pow(1 - k, 2.2);
+      l.pos.lerpVectors(DOCK_END, p4, e);
+      l.pos.x += Math.sin(age * 1.3) * 0.4 * (1 - k);
+    } else l.pos.copy(p4);
+    const dim = Math.max(0.6, 1 - days * 0.04);
+    const flick = 0.88 + 0.12 * Math.sin(time * 9 + l.phase * 7) * Math.sin(time * 5.3 + l.phase);
+    e4.set(Math.sin(time + l.phase) * 0.08, 0, Math.cos(time * 0.8 + l.phase) * 0.08);
+    m4.compose(l.pos, q4.setFromEuler(e4), s4.setScalar(l.mine ? 2.8 : 2.3));
+    bodies.setMatrixAt(i, m4);
+    bodies.setColorAt(i, tint.copy(l.color).multiplyScalar(1.75 * dim * flick));
+    hp.set([l.pos.x, l.pos.y, l.pos.z], i * 3);
+    hc.set([l.color.r * 1.0 * dim, l.color.g * 0.45 * dim, l.color.b * 0.12 * dim], i * 3);
+  });
+  bodies.count = lanterns.length; bodies.instanceMatrix.needsUpdate = true; if (bodies.instanceColor) bodies.instanceColor.needsUpdate = true;
+  halos.geometry.setDrawRange(0, lanterns.length);
+  halos.geometry.attributes.position.needsUpdate = halos.geometry.attributes.color.needsUpdate = true;
+
+  // Far lanterns: rise slowly forever (wrapping back below the ridges).
+  skySeeds.forEach((s, i) => {
+    const y = 6 + ((s.y + time * 0.004 * s.s) % 1) * 150;
+    const a = s.a + time * 0.002;
+    m4.compose(p4.set(Math.cos(a) * s.r, y, Math.sin(a) * s.r - 30), q4.identity(), s4.setScalar(2.4 * s.s));
+    sky.setMatrixAt(i, m4);
+    sky.setColorAt(i, tint.copy(s.c).multiplyScalar(1.25 * (0.75 + 0.25 * Math.sin(time * 3 + s.ph))));
+  });
+  sky.count = skySeeds.length; sky.instanceMatrix.needsUpdate = true; if (sky.instanceColor) sky.instanceColor.needsUpdate = true;
+
+  // Lanterns floating on the lake, bobbing gently.
+  floatSeeds.forEach((s, i) => {
+    const a = s.a + time * s.sp;
+    m4.compose(p4.set(Math.cos(a) * s.r, 0.35 + Math.sin(time * 1.4 + s.ph) * 0.06, Math.sin(a) * s.r), q4.setFromEuler(e4.set(Math.sin(time + s.ph) * 0.06, 0, 0)), s4.set(1.1, 0.7, 1.1));
+    floaters.setMatrixAt(i, m4);
+    floaters.setColorAt(i, tint.copy(s.c).multiplyScalar(1.3));
+  });
+  floaters.count = floatSeeds.length; floaters.instanceMatrix.needsUpdate = true; if (floaters.instanceColor) floaters.instanceColor.needsUpdate = true;
+}
+
+// Shooting stars now and then.
+const streak = (() => {
+  const g = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+  const l = new THREE.Line(g, new THREE.LineBasicMaterial({ color: new THREE.Color(2, 2, 2.2), transparent: true, opacity: 0, fog: false, toneMapped: false }));
+  l.frustumCulled = false; scene.add(l); return { l, t: -1, from: new THREE.Vector3(), dir: new THREE.Vector3(), next: 4 };
+})();
+const head = new THREE.Vector3(), tail = new THREE.Vector3();
+function shootingStar(time, dt) {
+  const s = streak;
+  if (s.t < 0 && time > s.next) {
+    s.t = 0; s.next = time + 6 + Math.random() * 10;
+    const a = (Math.random() - 0.5) * 1.6;
+    s.from.set(Math.sin(a) * 700, 300 + Math.random() * 250, -Math.cos(a) * 700);
+    s.dir.set(Math.random() < 0.5 ? -1 : 1, -0.45, Math.random() * 0.4).normalize();
+  }
+  if (s.t < 0) return;
+  s.t += dt;
+  const k = s.t / 0.9;
+  head.copy(s.from).addScaledVector(s.dir, k * 260); tail.copy(head).addScaledVector(s.dir, -70);
+  s.l.geometry.attributes.position.setXYZ(0, tail.x, tail.y, tail.z); s.l.geometry.attributes.position.setXYZ(1, head.x, head.y, head.z);
+  s.l.geometry.attributes.position.needsUpdate = true;
+  s.l.material.opacity = Math.sin(Math.min(1, k) * Math.PI);
+  if (k >= 1) { s.t = -1; s.l.material.opacity = 0; }
+}
+
+// === PLAYER / CONTROLS ===
+// You stand on the dock: drag to look around, pinch / scroll to zoom.
+let yaw = 0, pitch = 0.2, tYaw = 0, tPitch = 0.2, fov = camera.fov, tFov = camera.fov;
+const YAW = 1.3, PITCH = [-0.12, 1.0];
+const pointers = new Map(); let dragDist = 0, pinch0 = 0, idleSince = performance.now();
+const el = renderer.domElement;
+el.addEventListener('pointerdown', (e) => { pointers.set(e.pointerId, { x: e.clientX, y: e.clientY }); el.setPointerCapture(e.pointerId); dragDist = 0; idleSince = performance.now(); if (pointers.size === 2) pinch0 = pinchDist(); });
+el.addEventListener('pointermove', (e) => {
+  const p = pointers.get(e.pointerId); if (!p) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y; p.x = e.clientX; p.y = e.clientY;
+  if (pointers.size === 2) { const d = pinchDist(); tFov = THREE.MathUtils.clamp(tFov - (d - pinch0) * 0.08, 32, 76); pinch0 = d; return; }
+  dragDist += Math.abs(dx) + Math.abs(dy);
+  tYaw = THREE.MathUtils.clamp(tYaw + dx * 0.0042, -YAW, YAW);
+  tPitch = THREE.MathUtils.clamp(tPitch + dy * 0.0038, PITCH[0], PITCH[1]);
+});
+el.addEventListener('pointerup', (e) => { if (pointers.has(e.pointerId) && pointers.size === 1 && dragDist < 8) pick(e.clientX, e.clientY); pointers.delete(e.pointerId); });
+el.addEventListener('pointercancel', (e) => pointers.delete(e.pointerId));
+el.addEventListener('wheel', (e) => { tFov = THREE.MathUtils.clamp(tFov + e.deltaY * 0.03, 32, 76); }, { passive: true });
+function pinchDist() { const [a, b] = [...pointers.values()]; return Math.hypot(a.x - b.x, a.y - b.y); }
+
+// Tap a lantern → read its wish (nearest lantern on screen, generous for fingers).
+const card = document.getElementById('card'); let cardTimer = 0;
+const v3 = new THREE.Vector3();
+function pick(x, y) {
+  let best = null, bestD = isTouch ? 46 : 32;
+  for (const l of lanterns) {
+    v3.copy(l.pos).project(camera); if (v3.z > 1) continue;
+    const d = Math.hypot((v3.x * 0.5 + 0.5) * innerWidth - x, (-v3.y * 0.5 + 0.5) * innerHeight - y);
+    if (d < bestD) { bestD = d; best = l; }
+  }
+  if (!best) { card.classList.remove('on'); return; }
+  card.querySelector('.w').textContent = `“${best.w}”`;
+  card.querySelector('.by').textContent = `${best.mine ? 'Your wish' : best.n} · ${ago(best.t)}`;
+  card.classList.add('on'); clearTimeout(cardTimer); cardTimer = setTimeout(() => card.classList.remove('on'), 6000);
+  chime(660 + Math.random() * 200, 0.05);
+}
+function ago(t) { const s = (Date.now() - t) / 1000; if (s < 60) return 'just now'; if (s < 3600) return `${Math.floor(s / 60)} min ago`; if (s < 86400) return `${Math.floor(s / 3600)} h ago`; return `${Math.floor(s / 86400)} days ago`; }
+
+// === UI ===
+const form = document.getElementById('wish'), input = document.getElementById('wishText'), btn = document.getElementById('release');
+input.addEventListener('input', () => (btn.disabled = !clean(input.value)));
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const w = clean(input.value); if (!w) return;
+  input.value = ''; btn.disabled = true; input.blur();
+  const item = { id: Math.random().toString(36).slice(2, 10) + Date.now().toString(36), w, n: me.name, c: me.color, by: me.id, t: Date.now() };
+  addLantern(item, { fresh: true });
+  tYaw = 0; tPitch = 0.32; // look at it lift off
+  chord();
+  room?.send({ lantern: item });
+  try { await store.push(KEY, item, CONFIG.maxLanterns); } catch { orb?.toast?.('Your lantern is floating here — it will be shared once you’re back online'); }
+  orb?.toast?.('Your wish is on its way ✨');
+});
+
+const hint = document.getElementById('hint');
+if (isTouch) hint.textContent = 'Drag to look · tap a lantern to read it';
+setTimeout(() => (hint.style.opacity = 0), 6500);
+
+// Soft sounds (only after the first tap or key, as browsers require).
+let audio = null;
+function ctx() { if (!audio) try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch {} return audio; }
+function chime(freq, vol = 0.07, delay = 0) {
+  const a = ctx(); if (!a) return;
+  const t = a.currentTime + delay, o = a.createOscillator(), g = a.createGain();
+  o.type = 'sine'; o.frequency.value = freq; g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(vol, t + 0.02); g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+  o.connect(g).connect(a.destination); o.start(t); o.stop(t + 1.7);
+}
+function chord() { [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => chime(f, 0.06, i * 0.12)); }
+addEventListener('visibilitychange', () => { if (document.hidden) audio?.suspend?.(); else audio?.resume?.(); });
+
+// === SHARING ===
+// Everyone's wishes come from the shared list; new ones also arrive live through the room.
+const room = orb?.room?.join((e) => {
+  if (e.type === 'message' && e.data?.lantern) { const l = addLantern(e.data.lantern, { fresh: true }); if (l) chime(880, 0.03); }
+});
+let seeded = false;
+async function refresh() {
+  try {
+    const list = await store.get(KEY);
+    if (Array.isArray(list)) {
+      for (const item of list) addLantern(item);
+      const real = lanterns.filter((l) => !l.orbSeed).length;
+      let extra = lanterns.filter((l) => l.orbSeed).length - Math.max(0, STARTERS.length - real);
+      for (let i = 0; i < lanterns.length && extra > 0; i++) if (lanterns[i].orbSeed) { known.delete(lanterns[i].id); lanterns.splice(i--, 1); extra--; }
+    }
+  } catch {}
+  if (!seeded) { seeded = true; seedStarters(STARTERS.length - lanterns.length); }
+  updateCount();
+}
+await refresh();
+setInterval(refresh, 45000);
+setTimeout(() => orb?.capture?.(), 4000);
+
+// === LOOP ===
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), CONFIG.bloom.strength, CONFIG.bloom.radius, CONFIG.bloom.threshold);
+if (small) bloom.resolution.set(innerWidth / 2, innerHeight / 2);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+const timer = new THREE.Timer();
+const look = new THREE.Vector3();
+renderer.setAnimationLoop((t) => {
+  timer.update(t);
+  const dt = Math.min(Math.max(timer.getDelta(), 0), 0.05), time = performance.now() / 1000;
+  // Idle: drift the view slowly so the sky feels alive.
+  if (pointers.size === 0 && performance.now() - idleSince > 9000) { tYaw = Math.sin(time * 0.05) * 0.55; tPitch = 0.22 + Math.sin(time * 0.07) * 0.1; }
+  yaw += (tYaw - yaw) * Math.min(1, dt * 5); pitch += (tPitch - pitch) * Math.min(1, dt * 5);
+  fov += (tFov - fov) * Math.min(1, dt * 6); if (Math.abs(camera.fov - fov) > 0.01) { camera.fov = fov; camera.updateProjectionMatrix(); }
+  camera.position.set(EYE.x, EYE.y + Math.sin(time * 0.6) * 0.04, EYE.z);
+  look.set(Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), -Math.cos(yaw) * Math.cos(pitch)).add(camera.position);
+  camera.lookAt(look);
+
+  layoutLanterns(time);
+  shootingStar(time, dt);
+  skyMat.uniforms.time.value = time;
+  water.material.uniforms.time.value = time * 0.35;
+  const fp = flies.geometry.attributes.position.array, seed = flies.userData.seed;
+  for (let i = 0; i < seed.length; i++) fp[i * 3 + 1] += Math.sin(time * 1.4 + seed[i]) * dt * 0.3;
+  flies.geometry.attributes.position.needsUpdate = true;
+  flies.material.opacity = 0.6 + Math.sin(time * 2.2) * 0.3;
+  composer.render();
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
+  halos.material.uniforms.px.value = renderer.getPixelRatio() * innerHeight * 0.5;
+});
+</script>
+</body>
+</html>
